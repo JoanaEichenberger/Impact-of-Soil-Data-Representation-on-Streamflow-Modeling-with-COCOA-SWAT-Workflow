@@ -386,3 +386,12 @@ also need:
 
 For questions about the workflow or requests for model files and archived
 simulation outputs, please open an issue in this repository.
+
+## License
+
+The R scripts in this repository are licensed under the MIT License. See
+[LICENSE](LICENSE) for details.
+
+This license does not apply to SWAT+, external R packages, model input data,
+archived simulations, or other third-party materials, which remain subject to
+their respective licenses and terms of use.
