@@ -73,23 +73,33 @@ data, and best-20 reruns:
 
 ```text
 SWAT_SOIL_PROJECT_ROOT/
-|-- catchment_boundary.shp
 |-- Local-Soil/
 |   |-- txtinout/
+|   |   |-- Local-Soil_1000_all_q
+|   |   |-- Local-Soil_2000_sensitive_q
+|   |   `-- SWAT+ TxtInOut files
 |   |-- Local-soil_texture_before.tif
 |   `-- Local-soil_texture_after.tif
 |-- Swiss-Soil/
 |   |-- txtinout/
+|   |   |-- Swiss-Soil_1000_all_q
+|   |   |-- Swiss-Soil_2000_sensitive_q
+|   |   `-- SWAT+ TxtInOut files
 |   |-- Swiss-soil_texture_before.tif
 |   `-- Swiss-soil_texture_after.tif
 |-- World-Soil/
 |   |-- txtinout/
+|   |   |-- World-Soil_1000_all_q
+|   |   |-- World-Soil_2000_sensitive_q
+|   |   `-- SWAT+ TxtInOut files
 |   |-- World-soil_texture_before.tif
 |   `-- World-soil_texture_after.tif
 |-- Observed_data/
 |   `-- pg_vlg_1993-2021.txt
+|-- Catchment_boundary/
+|   `-- PetiteGlane_official.shp
 |-- Calibration/
-    |--calibration_best/
+    `-- calibration_best20/
         |-- Local-Soil/
         |   |-- cal_1/
         |   |-- ...
@@ -206,6 +216,8 @@ Keep:
 
 ```r
 run_final_ensembles <- FALSE
+initial_wb_run_mode <- "none"
+best20_rerun_mode <- "none"
 calibration_seed <- NA_integer_
 ```
 
@@ -236,6 +248,21 @@ The script performs the following steps:
 12. generates monthly soil-water storage, aquifer storage, and aquifer-flow
     diagnostics; and
 13. saves the manuscript figures and tables.
+
+### Generate the initial uncalibrated water-balance outputs
+
+The initial water-balance comparison requires monthly and average-annual SWAT+
+outputs from each uncalibrated base project. If these outputs are absent, set:
+
+```r
+initial_wb_run_mode <- "missing"
+```
+
+The script verifies that `calibration.cal` is not active in each base project's
+`file.cio`, configures `print.prt`, and runs only scenarios with missing or
+incomplete outputs. Use `initial_wb_run_mode <- "all"` to deliberately rerun
+all three base projects, or `"none"` to prevent simulations from being
+launched.
 
 Run:
 
@@ -273,10 +300,23 @@ The script exports this mapping to:
 output/calibration_analysis/tables/selected_best1percent_run_ids.csv
 ```
 
-The existing `cal_1` to `cal_20` directories must have been generated using
-the same selected IDs, in the same order, as the current 2,000-run ensembles.
-If they do not match, the water-balance and monthly-state analyses are not
-linked to the selected streamflow simulations.
+Newly generated reruns contain a `.selected_run_id` marker that allows the
+script to verify this mapping. Complete legacy reruns without this marker are
+accepted with a warning in `"none"` or `"missing"` mode.
+
+If one or more rerun directories or required output files are missing, set:
+
+```r
+best20_rerun_mode <- "missing"
+```
+
+The script then extracts the selected parameter rows from the archived
+2,000-run objects and reruns only missing, incomplete, or ID-mismatched
+positions in parallel. Each model `txtinout` directory must contain exactly
+one SWAT+ executable. Use `best20_rerun_mode <- "all"` to deliberately replace
+all 60 reruns, including legacy or previously verified outputs. Keep
+`best20_rerun_mode <- "none"` when the outputs are already complete and no
+simulations should be launched.
 
 ### Generate new final ensembles
 
@@ -303,10 +343,10 @@ The dates, analysis periods, parameter bounds, ranking method, and performance
 metrics should also remain unchanged.
 
 **Important:** setting `run_final_ensembles <- TRUE` generates the daily
-streamflow ensembles but does not automatically create the `cal_1` to `cal_20`
-water-balance reruns. After identifying the new selected IDs, those parameter
-sets must be rerun with the required monthly and average-annual SWAT+ outputs
-enabled before the water-balance and state-variable sections can be executed.
+streamflow ensembles. Set `best20_rerun_mode <- "missing"` in the same run if the
+newly selected parameter sets should also be rerun with the monthly and
+average-annual outputs required for the water-balance and state-variable
+analyses.
 
 ## 6. Running `03_Soil_aggregation`
 
@@ -321,9 +361,9 @@ This script uses the soil-aggregation functions in `functions.R` and produces:
   after aggregation and the absolute and relative changes.
 
 The script uses the same `SWAT_SOIL_PROJECT_ROOT` environment variable as the
-two calibration scripts. Within each scenario directory it expects
-`soil_texture_before.tif` and `soil_texture_after.tif`. It expects the
-catchment boundary at `SWAT_SOIL_PROJECT_ROOT/catchment_boundary.shp`.
+two calibration scripts. Within each scenario directory it expects the two
+soil-texture rasters listed above. It expects the catchment boundary at
+`SWAT_SOIL_PROJECT_ROOT/Catchment_boundary/PetiteGlane_official.shp`.
 
 Only `texture_lookup` normally needs to be edited, and only when the integer
 texture codes use a different classification. The outputs are written to
@@ -379,19 +419,26 @@ also need:
 
 - the three configured SWAT+ projects;
 - observed daily streamflow;
-- the archived 1,000-run and 2,000-run SWATrunR objects, or the inputs and
-  computational resources required to recreate them; and
-- the best-20 rerun outputs used for the water-balance and monthly-state
-  analyses.
+- the archived 1,000-run and 2,000-run SWATrunR ensembles, or the inputs and
+  computational resources required to recreate them;
+- the soil raster files from before and after dominant-soil aggregation; and
+- the catchment-boundary data.
+
+The research data and model files associated with this study are available
+through the BORIS Portal of the University of Bern:
+
+> Eichenberger, J. (2026). *Research data and SWAT+ model files for the Petite
+> Glâne soil-representation study*. BORIS Portal, University of Bern.
+> https://doi.org/10.48620/101602
+
+The BORIS dataset contains the configured SWAT+ model files, observed
+streamflow data, soil-related spatial data, and archived calibration and
+sensitivity-analysis objects required by the workflow.
+
+The complete best-20 rerun output directories are not included because of
+their large storage requirements. These outputs can be regenerated using the
+model files, calibration information, and workflow provided in this
+repository.
 
 For questions about the workflow or requests for model files and archived
 simulation outputs, please open an issue in this repository.
-
-## License
-
-The R scripts in this repository are licensed under the MIT License. See
-[LICENSE](LICENSE) for details.
-
-This license does not apply to SWAT+, external R packages, model input data,
-archived simulations, or other third-party materials, which remain subject to
-their respective licenses and terms of use.

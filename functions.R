@@ -226,6 +226,592 @@ derive_water_balance_components <- function (water_balance, baseflow_value)
     }
     dplyr::bind_rows(water_balance, derived_components, tibble::tibble(component = "baseflow", value = baseflow_value))
 }
+
+# Files required by the publication workflow from each calibrated best-20
+# rerun. The average-annual files support the water-balance analysis; the
+# monthly files support the evapotranspiration and storage/release analyses.
+best20_required_output_files <- function()
+{
+    c(
+        "basin_wb_aa.txt",
+        "basin_aqu_aa.txt",
+        "basin_wb_mon.txt",
+        "basin_aqu_mon.txt"
+    )
+}
+
+# Extract selected parameter rows by their original ensemble run IDs. This is
+# deliberately ID-based rather than position-based so failed runs removed from
+# a simulation object cannot shift the selected parameter rows.
+extract_selected_parameter_sets <- function(swat_run, run_ids)
+{
+    values <- as.data.frame(swat_run$parameter$values, check.names = FALSE)
+    definitions <- swat_run$parameter$definition
+
+    if (is.null(values) || nrow(values) == 0L) {
+        stop("The saved SWATrunR object contains no parameter values.")
+    }
+    if (is.null(definitions$full_name) ||
+        length(definitions$full_name) != ncol(values)) {
+        stop("Parameter definitions do not match the parameter-value columns.")
+    }
+
+    row_ids <- suppressWarnings(as.integer(rownames(values)))
+    if (length(row_ids) != nrow(values) || anyNA(row_ids) ||
+        anyDuplicated(row_ids)) {
+        row_ids <- seq_len(nrow(values))
+    }
+
+    run_ids <- as.integer(run_ids)
+    row_index <- match(run_ids, row_ids)
+    if (anyNA(row_index)) {
+        stop(
+            "Selected parameter IDs are missing from the saved run: ",
+            paste(run_ids[is.na(row_index)], collapse = ", ")
+        )
+    }
+
+    selected <- values[row_index, , drop = FALSE]
+    names(selected) <- definitions$full_name
+    rownames(selected) <- as.character(run_ids)
+    selected
+}
+
+# Write a SWAT+ calibration.cal file for one or more parameter rows and ensure
+# that file.cio registers it. This is adapted from the calibrated-rerun block
+# in the full project workflow and uses SWATrunR's calibration-file helpers.
+write_swatplus_calibration_file <- function(parameter_values,
+                                             model_path,
+                                             write_path,
+                                             i_run = 1L)
+{
+    parameter_table <- SWATrunR:::format_swatplus_parameter(parameter_values)
+    unit_conditions <- SWATrunR:::read_unit_conditions(model_path, parameter_table)
+    calibration_rows <- dplyr::bind_rows(lapply(
+        seq_len(nrow(parameter_table$definition)),
+        function(i) SWATrunR:::setup_calibration_cal(
+            parameter_table$definition[i, ], unit_conditions
+        )
+    ))
+
+    SWATrunR:::write_calibration(
+        write_path,
+        parameter_table,
+        calibration_rows,
+        seq_len(nrow(parameter_values)),
+        as.integer(i_run)
+    )
+
+    file_cio <- file.path(write_path, "file.cio")
+    if (!file.exists(file_cio)) {
+        stop("file.cio does not exist in ", write_path, ".")
+    }
+
+    cio_lines <- readLines(file_cio, warn = FALSE)
+    chg_row <- grep("^\\s*chg\\s+", cio_lines)
+    if (length(chg_row) != 1L) {
+        stop("Expected exactly one 'chg' row in ", file_cio, ".")
+    }
+
+    if (!grepl("\\bcalibration\\.cal\\b", cio_lines[chg_row])) {
+        updated_row <- sub(
+            "(cal_parms\\.cal\\s+)null\\b",
+            "\\1calibration.cal",
+            cio_lines[chg_row]
+        )
+        if (identical(updated_row, cio_lines[chg_row])) {
+            stop(
+                "Could not register calibration.cal in the 'chg' row of ",
+                file_cio, "."
+            )
+        }
+        cio_lines[chg_row] <- updated_row
+        writeLines(cio_lines, file_cio, useBytes = TRUE)
+    }
+}
+
+# Request monthly and average-annual outputs required by the publication
+# analyses while disabling other print frequencies, following the settings in
+# the complete calibration workflow.
+configure_best20_print_prt <- function(run_dir)
+{
+    print_file <- file.path(run_dir, "print.prt")
+    if (!file.exists(print_file)) {
+        stop("print.prt does not exist in ", run_dir, ".")
+    }
+
+    print_lines <- readr::read_lines(print_file, lazy = FALSE)
+    print_lines <- gsub(" y ", " n ", print_lines)
+
+    # These positions follow the print.prt layout used by the three published
+    # SWAT+ projects and reproduce the settings in hardcal_workflow_all.R.
+    output_rows <- c(
+        basin_wb = 11L,
+        basin_nb = 12L,
+        basin_ls = 13L,
+        basin_aqu = 15L,
+        hru_wb = 33L,
+        hru_ls = 35L,
+        hru_pw = 36L,
+        channel_sd = 42L
+    )
+
+    if (length(print_lines) < max(output_rows)) {
+        stop(
+            "print.prt in ", run_dir, " has only ", length(print_lines),
+            " lines; at least ", max(output_rows), " are required."
+        )
+    }
+    for (output_name in names(output_rows)) {
+        output_row <- output_rows[[output_name]]
+        if (!grepl(
+            paste0("^\\s*", output_name, "\\s+"),
+            print_lines[[output_row]]
+        )) {
+            stop(
+                "Expected '", output_name, "' on line ", output_row,
+                " of ", print_file, ", but found: ",
+                print_lines[[output_row]]
+            )
+        }
+    }
+
+    print_lines[11] <- "basin_wb                     n             y             n             y  "
+    print_lines[12] <- "basin_nb                     n             y             n             y  "
+    print_lines[13] <- "basin_ls                     n             y             n             y  "
+    print_lines[15] <- "basin_aqu                    n             y             n             y  "
+    print_lines[33] <- "hru_wb                       n             y             n             y  "
+    print_lines[35] <- "hru_ls                       n             y             n             y  "
+    print_lines[36] <- "hru_pw                       n             y             n             y  "
+    print_lines[42] <- "channel_sd                   n             y             n             y  "
+
+    readr::write_lines(print_lines, print_file)
+}
+
+# Verify that a base SWAT+ project represents the initial, uncalibrated setup.
+# A calibration.cal file may be present, but it must not be registered as the
+# active calibration file in the chg row of file.cio.
+assert_initial_project_uncalibrated <- function(project_path)
+{
+    file_cio <- file.path(project_path, "file.cio")
+    if (!file.exists(file_cio)) {
+        stop("file.cio does not exist in ", project_path, ".")
+    }
+
+    cio_lines <- readLines(file_cio, warn = FALSE)
+    chg_row <- grep("^\\s*chg\\s+", cio_lines)
+    if (length(chg_row) != 1L) {
+        stop("Expected exactly one 'chg' row in ", file_cio, ".")
+    }
+    if (grepl("\\bcalibration\\.cal\\b", cio_lines[[chg_row]])) {
+        stop(
+            "The base project in ", project_path,
+            " has calibration.cal activated in file.cio. It cannot be used ",
+            "as the initial uncalibrated model setup."
+        )
+    }
+}
+
+inspect_initial_water_balance_outputs <- function(
+    scenario_config,
+    required_files = best20_required_output_files())
+{
+    purrr::imap_dfr(scenario_config, function(config, scenario) {
+        project_path <- config$project_path
+        output_paths <- file.path(project_path, required_files)
+        output_exists <- file.exists(output_paths)
+        output_nonempty <- rep(FALSE, length(output_paths))
+        output_nonempty[output_exists] <-
+            file.info(output_paths[output_exists])$size > 0L
+
+        tibble::tibble(
+            scenario = scenario,
+            project_path = project_path,
+            outputs_complete = dir.exists(project_path) && all(output_nonempty),
+            missing_outputs = paste(
+                required_files[!output_nonempty], collapse = "; "
+            )
+        )
+    })
+}
+
+run_one_initial_water_balance <- function(
+    task,
+    required_files = best20_required_output_files())
+{
+    project_path <- task$project_path
+    if (!dir.exists(project_path)) {
+        stop("Initial SWAT+ project directory does not exist: ", project_path)
+    }
+
+    assert_initial_project_uncalibrated(project_path)
+    configure_best20_print_prt(project_path)
+
+    # Remove only the outputs used by this analysis so that a failed run cannot
+    # leave an older water balance that appears current.
+    stale_outputs <- file.path(project_path, required_files)
+    unlink(stale_outputs[file.exists(stale_outputs)], force = TRUE)
+
+    executables <- list.files(
+        project_path, pattern = "\\.exe$", full.names = TRUE, ignore.case = TRUE
+    )
+    if (length(executables) != 1L) {
+        stop(
+            "Expected exactly one SWAT+ executable in ", project_path,
+            ", but found ", length(executables), "."
+        )
+    }
+
+    old_directory <- getwd()
+    on.exit(setwd(old_directory), add = TRUE)
+    setwd(project_path)
+    exit_status <- system2(
+        executables[[1L]],
+        stdout = "initial_wb_swatplus_stdout.log",
+        stderr = "initial_wb_swatplus_stderr.log"
+    )
+    if (!identical(as.integer(exit_status), 0L)) {
+        stop(
+            "SWAT+ returned exit status ", exit_status,
+            " for the initial ", task$scenario, " run."
+        )
+    }
+
+    output_paths <- file.path(project_path, required_files)
+    if (!all(file.exists(output_paths)) ||
+        !all(file.info(output_paths)$size > 0L)) {
+        stop(
+            "The initial SWAT+ run did not produce all required outputs in ",
+            project_path, "."
+        )
+    }
+
+    data.frame(
+        scenario = task$scenario,
+        project_path = project_path,
+        status = "completed",
+        stringsAsFactors = FALSE
+    )
+}
+
+# Ensure that the three base projects contain the initial uncalibrated water-
+# balance outputs. run_mode is one of "none", "missing", or "all".
+ensure_initial_water_balance_outputs <- function(scenario_config,
+                                                  run_mode = "none",
+                                                  n_cores = 1L)
+{
+    run_mode <- match.arg(run_mode, c("none", "missing", "all"))
+    status <- inspect_initial_water_balance_outputs(scenario_config)
+    needs_run <- if (run_mode == "all") {
+        rep(TRUE, nrow(status))
+    } else {
+        !status$outputs_complete
+    }
+
+    if (any(needs_run) && run_mode == "none") {
+        affected <- paste(
+            paste0(
+                status$scenario[needs_run], " (missing: ",
+                status$missing_outputs[needs_run], ")"
+            ),
+            collapse = "; "
+        )
+        stop(
+            "Initial uncalibrated water-balance outputs are unavailable. ",
+            "Set initial_wb_run_mode = \"missing\" in the CONFIGURATION ",
+            "section to generate them. Affected scenarios: ", affected, "."
+        )
+    }
+
+    if (any(needs_run)) {
+        tasks <- lapply(which(needs_run), function(i) {
+            scenario <- status$scenario[[i]]
+            list(
+                scenario = scenario,
+                project_path = scenario_config[[scenario]]$project_path
+            )
+        })
+
+        cores <- max(1L, min(as.integer(n_cores), length(tasks)))
+        if (cores == 1L) {
+            invisible(lapply(tasks, run_one_initial_water_balance))
+        } else {
+            cluster <- parallel::makePSOCKcluster(cores, outfile = "")
+            on.exit(parallel::stopCluster(cluster), add = TRUE)
+            parallel::clusterExport(
+                cluster,
+                c(
+                    "best20_required_output_files",
+                    "configure_best20_print_prt",
+                    "assert_initial_project_uncalibrated",
+                    "run_one_initial_water_balance"
+                ),
+                envir = environment()
+            )
+            invisible(parallel::parLapply(
+                cluster, tasks, run_one_initial_water_balance
+            ))
+            parallel::stopCluster(cluster)
+            on.exit(NULL, add = FALSE)
+        }
+
+        status <- inspect_initial_water_balance_outputs(scenario_config)
+    }
+
+    if (any(!status$outputs_complete)) {
+        stop("Initial water-balance output verification failed after SWAT+ ran.")
+    }
+    status$status <- ifelse(needs_run, "generated", "existing")
+    list(status = status)
+}
+
+# Inspect existing rerun directories. A local marker records which original
+# 2,000-run ensemble ID was written to each positional directory cal_1, ...,
+# cal_20. Legacy directories without a marker are accepted as unverified and
+# reported explicitly; new reruns always receive a marker.
+inspect_best20_reruns <- function(best20_dirs,
+                                  selected_ids,
+                                  required_files = best20_required_output_files())
+{
+    if (!setequal(names(best20_dirs), names(selected_ids))) {
+        stop("best20_dirs and selected_ids must contain the same scenarios.")
+    }
+
+    purrr::imap_dfr(selected_ids, function(ids, scenario) {
+        root <- best20_dirs[[scenario]]
+        purrr::map2_dfr(seq_along(ids), as.integer(ids), function(position, run_id) {
+            run_dir <- file.path(root, paste0("cal_", position))
+            output_paths <- file.path(run_dir, required_files)
+            output_exists <- file.exists(output_paths)
+            output_nonempty <- rep(FALSE, length(output_paths))
+            output_nonempty[output_exists] <-
+                file.info(output_paths[output_exists])$size > 0L
+            outputs_complete <- dir.exists(run_dir) && all(output_nonempty)
+            missing_outputs <- required_files[!output_nonempty]
+
+            marker_file <- file.path(run_dir, ".selected_run_id")
+            recorded_run_id <- if (file.exists(marker_file)) {
+                marker_value <- readLines(marker_file, n = 1L, warn = FALSE)
+                if (length(marker_value) == 1L) {
+                    suppressWarnings(as.integer(marker_value))
+                } else {
+                    NA_integer_
+                }
+            } else {
+                NA_integer_
+            }
+            id_status <- if (is.na(recorded_run_id)) {
+                "unverified"
+            } else if (identical(recorded_run_id, run_id)) {
+                "verified"
+            } else {
+                "mismatch"
+            }
+
+            tibble::tibble(
+                scenario = scenario,
+                rerun_position = position,
+                run_id = run_id,
+                run_dir = run_dir,
+                outputs_complete = outputs_complete,
+                missing_outputs = paste(missing_outputs, collapse = "; "),
+                recorded_run_id = recorded_run_id,
+                id_status = id_status,
+                needs_rerun = !outputs_complete || id_status == "mismatch"
+            )
+        })
+    })
+}
+
+run_one_best20_rerun <- function(task,
+                                 required_files = best20_required_output_files())
+{
+    run_dir <- task$run_dir
+    model_path <- task$model_path
+
+    if (dir.exists(run_dir)) {
+        unlink(run_dir, recursive = TRUE, force = TRUE)
+    }
+    dir.create(run_dir, recursive = TRUE, showWarnings = FALSE)
+
+    model_files <- list.files(
+        model_path, full.names = TRUE, all.files = TRUE, no.. = TRUE
+    )
+    copied <- file.copy(
+        model_files, run_dir, recursive = TRUE,
+        copy.mode = TRUE, copy.date = TRUE
+    )
+    if (length(copied) != length(model_files) || !all(copied)) {
+        stop("Could not copy the complete SWAT+ project to ", run_dir, ".")
+    }
+
+    # Prevent stale output copied from the source project from being mistaken
+    # for output generated by this parameter set.
+    stale_outputs <- file.path(run_dir, required_files)
+    unlink(stale_outputs[file.exists(stale_outputs)], force = TRUE)
+
+    write_swatplus_calibration_file(
+        parameter_values = task$parameter_values,
+        model_path = model_path,
+        write_path = run_dir,
+        i_run = 1L
+    )
+    configure_best20_print_prt(run_dir)
+
+    executables <- list.files(
+        run_dir, pattern = "\\.exe$", full.names = TRUE, ignore.case = TRUE
+    )
+    if (length(executables) != 1L) {
+        stop(
+            "Expected exactly one SWAT+ executable in ", run_dir,
+            ", but found ", length(executables), "."
+        )
+    }
+
+    old_directory <- getwd()
+    on.exit(setwd(old_directory), add = TRUE)
+    setwd(run_dir)
+    exit_status <- system2(
+        executables[[1L]],
+        stdout = "swatplus_stdout.log",
+        stderr = "swatplus_stderr.log"
+    )
+    if (!identical(as.integer(exit_status), 0L)) {
+        stop(
+            "SWAT+ returned exit status ", exit_status,
+            " for ", task$scenario, " rerun position ", task$rerun_position, "."
+        )
+    }
+
+    output_paths <- file.path(run_dir, required_files)
+    if (!all(file.exists(output_paths)) ||
+        !all(file.info(output_paths)$size > 0L)) {
+        stop(
+            "SWAT+ did not produce all required best-20 outputs in ",
+            run_dir, "."
+        )
+    }
+
+    writeLines(as.character(task$run_id), file.path(run_dir, ".selected_run_id"))
+    data.frame(
+        scenario = task$scenario,
+        rerun_position = task$rerun_position,
+        run_id = task$run_id,
+        run_dir = run_dir,
+        status = "completed",
+        stringsAsFactors = FALSE
+    )
+}
+
+# Rerun only missing, incomplete, or ID-mismatched best-20 positions. Existing
+# complete legacy directories without ID markers are retained unless
+# rerun_unverified is TRUE.
+ensure_best20_reruns <- function(scenario_config,
+                                 saved_runs,
+                                 selected_ids,
+                                 best20_dirs,
+                                 run_if_needed = FALSE,
+                                 rerun_unverified = FALSE,
+                                 force_rerun = FALSE,
+                                 n_cores = 1L)
+{
+    scenario_names <- names(scenario_config)
+    if (!identical(sort(scenario_names), sort(names(saved_runs))) ||
+        !identical(sort(scenario_names), sort(names(selected_ids))) ||
+        !identical(sort(scenario_names), sort(names(best20_dirs)))) {
+        stop(
+            "scenario_config, saved_runs, selected_ids, and best20_dirs ",
+            "must contain the same named scenarios."
+        )
+    }
+
+    status <- inspect_best20_reruns(best20_dirs, selected_ids)
+    if (isTRUE(force_rerun)) {
+        status$needs_rerun <- TRUE
+    } else if (rerun_unverified) {
+        status$needs_rerun <- status$needs_rerun |
+            status$id_status == "unverified"
+    } else if (any(status$outputs_complete & status$id_status == "unverified")) {
+        warning(
+            "Some existing best-20 directories have complete outputs but no ",
+            "run-ID marker. They will be used as legacy reruns. Set ",
+            "best20_rerun_mode = \"all\" to regenerate and verify them."
+        )
+    }
+
+    needed <- status[status$needs_rerun, , drop = FALSE]
+    if (nrow(needed) > 0L && !isTRUE(run_if_needed)) {
+        needed_labels <- paste0(
+            needed$scenario, "/cal_", needed$rerun_position,
+            " (selected run ", needed$run_id, ")"
+        )
+        stop(
+            nrow(needed), " best-20 rerun(s) are missing, incomplete, or ",
+            "mapped to a different selected run ID. Set best20_rerun_mode = ",
+            "\"missing\" in the CONFIGURATION section to generate them. Affected ",
+            "positions: ", paste(needed_labels, collapse = ", "), "."
+        )
+    }
+
+    if (nrow(needed) > 0L) {
+        parameter_sets <- purrr::map2(
+            saved_runs[scenario_names],
+            selected_ids[scenario_names],
+            extract_selected_parameter_sets
+        )
+
+        tasks <- lapply(seq_len(nrow(needed)), function(i) {
+            row <- needed[i, ]
+            scenario <- row$scenario[[1L]]
+            position <- row$rerun_position[[1L]]
+            list(
+                scenario = scenario,
+                rerun_position = position,
+                run_id = row$run_id[[1L]],
+                run_dir = row$run_dir[[1L]],
+                model_path = scenario_config[[scenario]]$project_path,
+                parameter_values = parameter_sets[[scenario]][position, , drop = FALSE]
+            )
+        })
+
+        cores <- max(1L, min(as.integer(n_cores), length(tasks)))
+        if (cores == 1L) {
+            invisible(lapply(tasks, run_one_best20_rerun))
+        } else {
+            cluster <- parallel::makePSOCKcluster(cores, outfile = "")
+            on.exit(parallel::stopCluster(cluster), add = TRUE)
+            parallel::clusterExport(
+                cluster,
+                c(
+                    "best20_required_output_files",
+                    "configure_best20_print_prt",
+                    "write_swatplus_calibration_file",
+                    "run_one_best20_rerun"
+                ),
+                envir = environment()
+            )
+            invisible(parallel::parLapply(cluster, tasks, run_one_best20_rerun))
+            parallel::stopCluster(cluster)
+            on.exit(NULL, add = FALSE)
+        }
+
+        status <- inspect_best20_reruns(best20_dirs, selected_ids)
+    }
+
+    if (any(!status$outputs_complete | status$id_status == "mismatch")) {
+        stop("Best-20 rerun verification failed after the rerun step.")
+    }
+
+    rerun_dirs <- stats::setNames(lapply(names(best20_dirs), function(scenario) {
+        file.path(
+            best20_dirs[[scenario]],
+            paste0("cal_", seq_along(selected_ids[[scenario]]))
+        )
+    }), names(best20_dirs))
+
+    list(rerun_dirs = rerun_dirs, status = status)
+}
+
 read_water_balance_runs <- function (run_dirs, scenario, stage, run_ids = NULL) 
 {
     if (is.null(run_ids)) {

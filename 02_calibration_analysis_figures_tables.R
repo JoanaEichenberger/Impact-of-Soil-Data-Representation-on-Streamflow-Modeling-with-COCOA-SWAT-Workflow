@@ -30,6 +30,16 @@ swat_root <- Sys.getenv(
   unset = "D:/path/to/SWAT_SOIL_PROJECT_ROOT"
 )
 run_final_ensembles <- FALSE  # TRUE launches 3 x 2,000 SWAT+ simulations
+# Choose how the initial uncalibrated water-balance simulations are handled:
+#   "none"    = use existing outputs and stop if any are unavailable;
+#   "missing" = run only scenarios with missing/incomplete outputs;
+#   "all"     = deliberately rerun all three initial model setups.
+initial_wb_run_mode <- "none"
+# Choose how the process-diagnostic best-20 simulations are handled:
+#   "none"    = use existing outputs and stop if any are unavailable;
+#   "missing" = run only missing, incomplete, or ID-mismatched positions;
+#   "all"     = deliberately regenerate all 3 x 20 positions.
+best20_rerun_mode <- "none"
 calibration_seed <- NA_integer_ # enter the seed used for a new LHS ensemble
 n_runs <- 2000L
 n_selected <- 20L
@@ -472,12 +482,57 @@ save_publication_figure(
 ## ---------------------------------------------------------------------------
 ## 7. Water balance, evapotranspiration, and monthly states
 ## ---------------------------------------------------------------------------
-# cal_1, ..., cal_20 are rerun positions corresponding, in order, to selected_ids.
-rerun_dirs <- purrr::map(best20_dirs, ~file.path(.x, paste0("cal_", seq_len(n_selected))))
-missing_reruns <- purrr::keep(unlist(rerun_dirs), ~!dir.exists(.x))
-if (length(missing_reruns) > 0L) {
-  stop("Missing best-20 rerun directories: ", paste(missing_reruns, collapse = ", "))
+# The archived 2,000-run objects contain daily streamflow only. Separate
+# best-20 reruns are therefore required for average-annual water-balance files
+# and monthly ET/storage/release outputs. Directories cal_1, ..., cal_20 are
+# positional; each is linked to its original 2,000-run ensemble ID by
+# .selected_run_id. The action is controlled by best20_rerun_mode above.
+if (!exists("best20_rerun_mode", inherits = FALSE)) {
+  best20_rerun_mode <- "none"
+  message(
+    "best20_rerun_mode was not defined; using 'none'. ",
+    "Set it to 'missing' or 'all' before rerunning this section to launch SWAT+."
+  )
 }
+best20_rerun_mode <- match.arg(
+  best20_rerun_mode,
+  choices = c("none", "missing", "all")
+)
+best20_reruns <- ensure_best20_reruns(
+  scenario_config = scenario_config,
+  saved_runs = simulations_full,
+  selected_ids = selected_ids,
+  best20_dirs = best20_dirs,
+  run_if_needed = best20_rerun_mode != "none",
+  rerun_unverified = best20_rerun_mode == "all",
+  force_rerun = best20_rerun_mode == "all",
+  n_cores = n_cores
+)
+rerun_dirs <- best20_reruns$rerun_dirs
+readr::write_csv(
+  best20_reruns$status,
+  file.path(tables_dir, "best20_rerun_status.csv")
+)
+
+# The initial water balance comes from an uncalibrated SWAT+ run in each base
+# project directory. Generate these outputs when requested and verify that the
+# projects do not have calibration.cal activated in file.cio.
+if (!exists("initial_wb_run_mode", inherits = FALSE)) {
+  initial_wb_run_mode <- "none"
+  message(
+    "initial_wb_run_mode was not defined; using 'none'. ",
+    "Set it to 'missing' or 'all' before rerunning this section to launch SWAT+."
+  )
+}
+initial_wb_runs <- ensure_initial_water_balance_outputs(
+  scenario_config = scenario_config,
+  run_mode = initial_wb_run_mode,
+  n_cores = n_cores
+)
+readr::write_csv(
+  initial_wb_runs$status,
+  file.path(tables_dir, "initial_water_balance_run_status.csv")
+)
 
 initial_wb <- purrr::imap_dfr(scenario_config, ~read_water_balance_runs(
   .x$project_path, .x$label, "Initial", "initial"
